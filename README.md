@@ -56,8 +56,11 @@ If you have WSL installed:
 ```bash
 wsl
 cd /mnt/c/Users/debas/Videos/Big-Five/test-folder
-sudo apt update && sudo apt install -y git zip unzip openjdk-17-jdk autoconf libtool pkg-config zlib1g-dev libncurses5-dev libncursesw5-dev libtinfo5 cmake libffi-dev libssl-dev
+sudo apt update && sudo apt install -y git zip unzip openjdk-17-jdk autoconf libtool pkg-config zlib1g-dev libncurses-dev libtinfo6 cmake libffi-dev libssl-dev
 pip install --upgrade cython buildozer
 buildozer android debug
 ```
 The APK will appear in `bin/aadhaarscan-1.0.0-arm64-v8a-debug.apk`.
+
+
+Success
