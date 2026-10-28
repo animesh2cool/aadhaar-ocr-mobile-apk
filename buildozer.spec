@@ -20,7 +20,7 @@ version = 1.0.0
 
 # (list) Application requirements
 # comma separated e.g. requirements = sqlite3,kivy
-requirements = python3,kivy,openpyxl,pillow
+requirements = python3,kivy,pillow,openpyxl,et_xmlfile
 
 # (str) Supported orientation (one of landscape, sensorLandscape, portrait or all)
 orientation = portrait
@@ -41,7 +41,7 @@ android.minapi = 21
 android.ndk = 25b
 
 # (list) The Android architectures to build for
-android.archs = arm64-v8a, armeabi-v7a
+android.archs = arm64-v8a
 
 # (bool) If True, then skip trying to update the Android sdk
 # This can be useful to avoid excess Internet downloads or save time
