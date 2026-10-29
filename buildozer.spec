@@ -20,7 +20,7 @@ version = 1.0.0
 
 # (list) Application requirements
 # comma separated e.g. requirements = sqlite3,kivy
-requirements = python3,kivy,pillow,openpyxl,et_xmlfile
+requirements = python3,kivy,pillow,openpyxl,et_xmlfile,plyer
 
 # (str) Supported orientation (one of landscape, sensorLandscape, portrait or all)
 orientation = portrait
@@ -29,7 +29,7 @@ orientation = portrait
 fullscreen = 0
 
 # (list) Permissions
-android.permissions = CAMERA,READ_EXTERNAL_STORAGE,WRITE_EXTERNAL_STORAGE
+android.permissions = CAMERA,READ_EXTERNAL_STORAGE,WRITE_EXTERNAL_STORAGE,READ_MEDIA_IMAGES
 
 # (int) Target Android API, should be as high as possible.
 android.api = 33
@@ -42,6 +42,9 @@ android.ndk = 25b
 
 # (list) The Android architectures to build for
 android.archs = arm64-v8a
+
+# (list) Gradle dependencies to add
+android.gradle_dependencies = com.google.mlkit:text-recognition:16.0.0
 
 # (bool) If True, then skip trying to update the Android sdk
 # This can be useful to avoid excess Internet downloads or save time
