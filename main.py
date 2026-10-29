@@ -1,839 +1,878 @@
 """
-AadhaarScan Mobile — Improved Kivy + Google ML Kit edition
+AadhaarScan Mobile - Google ML Kit Edition (v2)
 
-Main improvements:
-- OCR runs on a background thread; Kivy widgets are updated on the main thread.
-- Prevents multiple simultaneous scans.
-- Better image-load and OCR error handling.
-- Fixes Excel export alignment bug and handles save errors.
-- Validates dates and normalizes common Aadhaar-number OCR spacing.
-- Masks the Aadhaar number in the UI by default (tap Show/Hide).
-- Avoids requesting broad legacy storage permissions at startup.
-- Stops the camera when the camera popup closes.
-- Stores temporary camera captures in the app's private storage.
-
-Important:
-- Android ML Kit requires the appropriate Buildozer/Python-for-Android Gradle dependency.
-- This file alone cannot configure or guarantee the APK's native dependencies.
-- The Kivy FileChooser is retained as a basic picker. On Android it may only show
-  files visible to the app. A native Android Photo Picker/SAF integration is a
-  separate improvement if you need to select directly from Gallery/Downloads.
-- OCR output is not verified identity data. Always review it before exporting.
+What changed vs v1 (all aimed at a smoother phone experience):
+- OCR, image prep and Excel export run on worker threads, so the UI never freezes
+- Photos are EXIF-corrected and downscaled before OCR (no sideways text / OOM crashes)
+- Gallery picking + saving to Downloads work with Android scoped storage
+- Camera permission is requested only when the camera is opened
+- Aadhaar number auto-formats as you type and is checked with the Verhoeff checksum
+- Scan several cards, review them in a list, export once
+- Toasts instead of blocking popups; Android back button closes popups first
+- Temporary card images are deleted after use
 """
 
-import os
-import re
-import threading
 import datetime
-import traceback
-from typing import Dict, Any, List, Optional
+import os
+import shutil
+import threading
+from typing import List
 
 from kivy.utils import platform
 
-# Desktop aspect-ratio simulation. Set before importing/creating the Window.
-if platform != "android":
+IS_ANDROID = platform == "android"
+
+# Desktop aspect ratio simulation (must run before the Window is created)
+if not IS_ANDROID:
     from kivy.config import Config
     Config.set("graphics", "width", "400")
     Config.set("graphics", "height", "800")
     Config.set("graphics", "resizable", "1")
 
+from kivy.animation import Animation
 from kivy.app import App
-from kivy.core.window import Window
-from kivy.metrics import dp
-from kivy.graphics import Color, RoundedRectangle, Rectangle
-from kivy.uix.boxlayout import BoxLayout
-from kivy.uix.gridlayout import GridLayout
-from kivy.uix.scrollview import ScrollView
-from kivy.uix.label import Label
-from kivy.uix.textinput import TextInput
-from kivy.uix.button import Button
-from kivy.uix.image import Image
-from kivy.uix.camera import Camera
-from kivy.uix.popup import Popup
 from kivy.clock import Clock
+from kivy.core.window import Window
+from kivy.graphics import Color, Line, PopMatrix, PushMatrix, RoundedRectangle, Rotate
+from kivy.logger import Logger
+from kivy.metrics import dp
+from kivy.uix.boxlayout import BoxLayout
+from kivy.uix.button import Button
+from kivy.uix.camera import Camera
+from kivy.uix.checkbox import CheckBox
+from kivy.uix.floatlayout import FloatLayout
+from kivy.uix.gridlayout import GridLayout
+from kivy.uix.image import Image
+from kivy.uix.label import Label
+from kivy.uix.popup import Popup
+from kivy.uix.scrollview import ScrollView
+from kivy.uix.spinner import Spinner
+from kivy.uix.textinput import TextInput
 
-import openpyxl
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from aadhaar_utils import (digits_only, export_records, format_aadhaar,
+                           is_valid_aadhaar, mask_aadhaar, parse_aadhaar_text,
+                           prepare_image)
+
+# ---------------------------------------------------------------- settings
+BG = (0.05, 0.07, 0.12, 1)
+CARD = (0.09, 0.12, 0.20, 1)
+FIELD = (0.14, 0.18, 0.28, 1)
+FIELD_FOCUS = (0.19, 0.24, 0.37, 1)
+ACCENT = (0.38, 0.40, 0.95, 1)
+MUTED = (0.25, 0.30, 0.45, 1)
+GREEN = (0.06, 0.72, 0.50, 1)
+RED = (0.75, 0.25, 0.28, 1)
+DIM = (0.6, 0.7, 0.85, 1)
+
+GENDERS = ("MALE", "FEMALE", "TRANSGENDER")
+GENDER_HINT = "Select"
+
+# The phone camera sensor is landscape; Kivy shows it sideways in portrait.
+# If the live preview looks rotated on your phone, change -90 to 90.
+CAMERA_ROTATION = -90 if IS_ANDROID else 0
+CAMERA_RESOLUTION = (1280, 720)
+
+SAMPLE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sample_aadhaar.png")
 
 Window.softinput_mode = "below_target"
-Window.clearcolor = (0.05, 0.07, 0.12, 1.0)
+Window.clearcolor = BG
 
 
-class StyledCard(BoxLayout):
-    """A rounded background card."""
-    def __init__(self, bg_color=(0.10, 0.13, 0.22, 1.0), radius=14, **kwargs):
+def stamp() -> str:
+    return datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def fit_image(img):
+    """Scale an Image/Camera to fit its box (works on old and new Kivy)."""
+    if hasattr(img, "fit_mode"):
+        img.fit_mode = "contain"
+    else:
+        img.allow_stretch = True
+        img.keep_ratio = True
+
+
+# ---------------------------------------------------------------- widgets
+class Card(BoxLayout):
+    """Rounded container."""
+
+    def __init__(self, bg=CARD, radius=14, **kwargs):
         super().__init__(**kwargs)
-        self.bg_color = bg_color
-        self.radius = radius
         with self.canvas.before:
-            Color(*self.bg_color)
-            self.rect = RoundedRectangle(
-                size=self.size, pos=self.pos, radius=[dp(self.radius)]
-            )
-        self.bind(size=self._update_rect, pos=self._update_rect)
+            Color(*bg)
+            self._rect = RoundedRectangle(pos=self.pos, size=self.size, radius=[dp(radius)])
+        self.bind(pos=self._sync, size=self._sync)
 
-    def _update_rect(self, *_args):
-        self.rect.size = self.size
-        self.rect.pos = self.pos
+    def _sync(self, *_):
+        self._rect.pos = self.pos
+        self._rect.size = self.size
 
 
+class Caption(Label):
+    """Small left-aligned label (text_size is bound so halign really works)."""
+
+    def __init__(self, **kwargs):
+        kwargs.setdefault("font_size", "11sp")
+        kwargs.setdefault("color", DIM)
+        kwargs.setdefault("size_hint_y", None)
+        kwargs.setdefault("height", dp(18))
+        kwargs.setdefault("halign", "left")
+        kwargs.setdefault("valign", "middle")
+        super().__init__(**kwargs)
+        self.bind(size=lambda inst, size: setattr(inst, "text_size", size))
+
+
+class FlatButton(Button):
+    """Rounded flat button with pressed / disabled tint."""
+
+    def __init__(self, bg=ACCENT, radius=10, **kwargs):
+        kwargs.setdefault("font_size", "13sp")
+        kwargs.setdefault("bold", True)
+        super().__init__(background_normal="", background_down="",
+                         background_disabled_normal="", background_disabled_down="",
+                         background_color=(0, 0, 0, 0), **kwargs)
+        self._bg = bg
+        with self.canvas.before:
+            self._tint_color = Color(*bg)
+            self._rect = RoundedRectangle(pos=self.pos, size=self.size, radius=[dp(radius)])
+        self.bind(pos=self._sync, size=self._sync, state=self._tint, disabled=self._tint)
+
+    def _sync(self, *_):
+        self._rect.pos = self.pos
+        self._rect.size = self.size
+
+    def _tint(self, *_):
+        r, g, b, a = self._bg
+        if self.disabled:
+            self._tint_color.rgba = (r * 0.4, g * 0.4, b * 0.4, a)
+        elif self.state == "down":
+            self._tint_color.rgba = (r * 0.7, g * 0.7, b * 0.7, a)
+        else:
+            self._tint_color.rgba = self._bg
+
+
+class Field(TextInput):
+    """Flat single-line input with a focus highlight."""
+
+    def __init__(self, **kwargs):
+        kwargs.setdefault("multiline", False)
+        kwargs.setdefault("size_hint_y", None)
+        kwargs.setdefault("height", dp(44))
+        kwargs.setdefault("font_size", "14sp")
+        kwargs.setdefault("padding", [dp(10), dp(13), dp(10), dp(8)])
+        kwargs.setdefault("foreground_color", (1, 1, 1, 1))
+        kwargs.setdefault("cursor_color", (0.6, 0.65, 1, 1))
+        kwargs.setdefault("hint_text_color", (1, 1, 1, 0.3))
+        super().__init__(background_normal="", background_active="",
+                         background_color=FIELD, write_tab=False, **kwargs)
+        self.bind(focus=lambda inst, focused: setattr(
+            inst, "background_color", FIELD_FOCUS if focused else FIELD))
+
+
+class Toast(Card):
+    """Small auto-hiding message. Never steals touches."""
+
+    def __init__(self, text, error=False, **kwargs):
+        super().__init__(bg=(0.55, 0.15, 0.18, 1) if error else (0.16, 0.19, 0.30, 1),
+                         radius=12, orientation="vertical", padding=(dp(14), dp(10)),
+                         size_hint=(0.92, None), height=dp(44),
+                         pos_hint={"center_x": 0.5, "y": 0.17}, **kwargs)
+        self.label = Label(text=text, font_size="13sp", halign="center", valign="middle",
+                           size_hint_y=None)
+        self.label.bind(width=lambda inst, w: setattr(inst, "text_size", (w, None)))
+        self.label.bind(texture_size=self._fit)
+        self.add_widget(self.label)
+
+    def _fit(self, _inst, size):
+        self.label.height = size[1]
+        self.height = size[1] + dp(20)
+
+    def on_touch_down(self, touch):
+        return False
+
+
+class CameraView(FloatLayout):
+    """Live viewfinder that shows the landscape sensor feed upright, with a card-shaped guide."""
+
+    def __init__(self, rotation=0, resolution=(1280, 720), **kwargs):
+        super().__init__(**kwargs)
+        self.rotation = rotation
+        self.cam = Camera(index=0, resolution=resolution, play=False, size_hint=(None, None))
+        fit_image(self.cam)
+        self.add_widget(self.cam)
+        with self.canvas.before:
+            PushMatrix()
+            self._rot = Rotate(angle=rotation, origin=self.center)
+        with self.canvas.after:
+            PopMatrix()
+            Color(1, 1, 1, 0.85)
+            self._guide = Line(rounded_rectangle=(0, 0, 0, 0, dp(10)), width=dp(1.8))
+        self.bind(pos=self._layout, size=self._layout)
+
+    def _layout(self, *_):
+        w, h = self.size
+        sideways = abs(self.rotation) % 180 == 90
+        self.cam.size = (h, w) if sideways else (w, h)
+        self.cam.center = self.center
+        self._rot.origin = self.center
+        gw = w * 0.92
+        gh = gw / 1.586                      # ID-1 card ratio
+        if gh > h * 0.92:
+            gh = h * 0.92
+            gw = gh * 1.586
+        self._guide.rounded_rectangle = (self.center_x - gw / 2, self.center_y - gh / 2,
+                                         gw, gh, dp(10))
+
+    def start(self):
+        self.cam.play = True
+
+    def stop(self):
+        self.cam.play = False
+
+    def snapshot(self, path):
+        if self.cam.texture is None:
+            raise RuntimeError("Camera is still starting - try again in a second")
+        self.cam.export_to_png(path)         # unrotated; caller rotates by self.rotation
+
+
+# ---------------------------------------------------------------- app
 class AadhaarMobileApp(App):
+
+    # ------------------------------------------------------------ build
     def build(self):
         self.title = "AadhaarScan"
-        self.current_image_path: Optional[str] = None
-        self.camera_widget: Optional[Camera] = None
-        self.camera_popup: Optional[Popup] = None
-        self._ocr_running = False
-        self._scan_lock = threading.Lock()
-        self._scan_id = 0
-        self._last_aadhaar_value = ""
-        self._aadhaar_visible = False
+        self.records: List[dict] = []
+        self._busy = False
+        self._popup = None
+        self._temp_files: List[str] = []
+        self._recognizer = None
+        self._desktop_ocr = None
+        self._chooser = None
+        self._dots_event = None
+        self._dot_count = 0
+        self._status_base = ""
+        self._action_buttons: List[Button] = []
 
-        root = BoxLayout(
-            orientation="vertical", padding=dp(12), spacing=dp(8)
-        )
-        with root.canvas.before:
-            Color(0.05, 0.07, 0.12, 1.0)
-            self.bg_rect = Rectangle(size=root.size, pos=root.pos)
-        root.bind(size=self._update_bg, pos=self._update_bg)
+        self.root_float = FloatLayout()
+        main = BoxLayout(orientation="vertical", padding=dp(12), spacing=dp(8))
+        main.add_widget(self._build_header())
+        main.add_widget(self._build_body())
+        main.add_widget(self._build_actions())
+        self.root_float.add_widget(main)
 
-        # Header
+        Window.bind(on_keyboard=self._on_keyboard)
+        self._refresh_counts()
+        return self.root_float
+
+    def _build_header(self):
         header = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(8))
-        title = Label(
-            text="[b]AadhaarScan[/b] [color=818cf8]ML Kit[/color]",
-            markup=True, font_size="18sp",
-            halign="left", valign="middle"
-        )
-        title.bind(size=title.setter("text_size"))
+        title = Label(text="[b]AadhaarScan[/b] [color=818cf8]ML Kit[/color]", markup=True,
+                      font_size="18sp", halign="left", valign="middle")
+        title.bind(size=lambda inst, size: setattr(inst, "text_size", size))
         header.add_widget(title)
+        if os.path.exists(SAMPLE_PATH):
+            header.add_widget(FlatButton(text="Sample", size_hint=(None, 1), width=dp(70),
+                                         bg=MUTED, font_size="12sp",
+                                         on_release=self.load_sample))
+        self.btn_list = FlatButton(text="List (0)", size_hint=(None, 1), width=dp(84),
+                                   bg=MUTED, font_size="12sp", on_release=self.show_records)
+        header.add_widget(self.btn_list)
+        return header
 
-        sample_btn = self._button(
-            "Sample", (0.38, 0.40, 0.95, 0.9), width=dp(88)
-        )
-        sample_btn.bind(on_press=self.load_sample)
-        header.add_widget(sample_btn)
-        root.add_widget(header)
-
-        # Scrollable content
-        scroll = ScrollView(size_hint=(1, 1), do_scroll_x=False)
-        content = BoxLayout(
-            orientation="vertical", spacing=dp(10), size_hint_y=None
-        )
+    def _build_body(self):
+        scroll = ScrollView(do_scroll_x=False, bar_width=dp(3))
+        content = BoxLayout(orientation="vertical", spacing=dp(10), size_hint_y=None,
+                            padding=(0, 0, 0, dp(8)))
         content.bind(minimum_height=content.setter("height"))
 
-        preview_card = StyledCard(
-            bg_color=(0.08, 0.11, 0.18, 1.0),
-            orientation="vertical", padding=dp(6),
-            size_hint_y=None, height=dp(210)
-        )
-        self.img_preview = Image(
-            source="", allow_stretch=True, keep_ratio=True
-        )
-        preview_card.add_widget(self.img_preview)
-        content.add_widget(preview_card)
+        # preview
+        preview = Card(bg=(0.08, 0.11, 0.18, 1), padding=dp(6), size_hint_y=None, height=dp(190))
+        stack = FloatLayout()
+        self.preview_hint = Label(text="Card preview appears here", font_size="12sp",
+                                  color=DIM, pos_hint={"center_x": 0.5, "center_y": 0.5})
+        self.img_preview = Image(source="")
+        fit_image(self.img_preview)
+        stack.add_widget(self.preview_hint)
+        stack.add_widget(self.img_preview)
+        preview.add_widget(stack)
+        content.add_widget(preview)
 
-        self.status_label = Label(
-            text="Scan a document, select an image, or load a sample.",
-            font_size="12sp", color=(0.65, 0.75, 0.85, 1),
-            size_hint_y=None, height=dp(36),
-            halign="center", valign="middle"
-        )
-        self.status_label.bind(size=self.status_label.setter("text_size"))
-        content.add_widget(self.status_label)
+        # status
+        self.status = Label(text="Tap Camera or Gallery to scan a card", font_size="12sp",
+                            color=DIM, size_hint_y=None, height=dp(24))
+        content.add_widget(self.status)
 
-        form_card = StyledCard(
-            bg_color=(0.09, 0.12, 0.20, 1.0),
-            orientation="vertical", padding=dp(12), spacing=dp(6),
-            size_hint_y=None
-        )
-        form_card.bind(minimum_height=form_card.setter("height"))
+        # form
+        form = Card(bg=CARD, orientation="vertical", padding=dp(12), spacing=dp(6),
+                    size_hint_y=None)
+        form.bind(minimum_height=form.setter("height"))
 
-        self.input_name = self._add_field(
-            form_card, "FULL NAME", "Enter full name"
-        )
+        top = BoxLayout(size_hint_y=None, height=dp(30))
+        top.add_widget(Caption(text="DETAILS", height=dp(30)))
+        top.add_widget(FlatButton(text="Clear", size_hint=(None, None), size=(dp(64), dp(30)),
+                                  bg=MUTED, font_size="11sp", on_release=self.clear_form))
+        form.add_widget(top)
 
-        # Aadhaar field + show/hide control
-        form_card.add_widget(self._field_label("AADHAAR NUMBER"))
-        aadhaar_row = BoxLayout(
-            orientation="horizontal", spacing=dp(6),
-            size_hint_y=None, height=dp(42)
-        )
-        self.input_aadhaar = TextInput(
-            hint_text="XXXX XXXX XXXX", multiline=False,
-            password=True, size_hint=(1, 1), font_size="16sp",
-            background_color=(0.18, 0.12, 0.15, 1),
-            foreground_color=(1, 0.65, 0.65, 1),
-            cursor_color=(1, 1, 1, 1)
-        )
-        self.input_aadhaar.bind(text=self._on_aadhaar_edited)
-        aadhaar_row.add_widget(self.input_aadhaar)
-        self.btn_toggle_aadhaar = self._button(
-            "Show", (0.25, 0.30, 0.45, 1), width=dp(70)
-        )
-        self.btn_toggle_aadhaar.bind(on_press=self.toggle_aadhaar_visibility)
-        aadhaar_row.add_widget(self.btn_toggle_aadhaar)
-        form_card.add_widget(aadhaar_row)
+        form.add_widget(Caption(text="FULL NAME"))
+        self.input_name = Field(hint_text="e.g. RAHUL KUMAR")
+        form.add_widget(self.input_name)
 
-        row_cols = GridLayout(
-            cols=2, spacing=dp(8), size_hint_y=None, height=dp(64)
-        )
+        form.add_widget(Caption(text="AADHAAR NUMBER"))
+        self.input_aadhaar = Field(hint_text="XXXX XXXX XXXX", font_size="17sp",
+                                   input_type="number", height=dp(48),
+                                   foreground_color=(1, 0.8, 0.8, 1))
+        self.input_aadhaar.bind(text=self._on_aadhaar_text)
+        form.add_widget(self.input_aadhaar)
+        self.validity = Caption(text="", markup=True)
+        form.add_widget(self.validity)
+
+        row = GridLayout(cols=2, spacing=dp(8), size_hint_y=None, height=dp(66))
         dob_col = BoxLayout(orientation="vertical", spacing=dp(2))
-        dob_col.add_widget(self._field_label("DATE OF BIRTH"))
-        self.input_dob = TextInput(
-            hint_text="DD/MM/YYYY or YYYY", multiline=False,
-            size_hint_y=None, height=dp(40), font_size="13sp",
-            background_color=(0.14, 0.18, 0.28, 1),
-            foreground_color=(1, 1, 1, 1)
-        )
+        dob_col.add_widget(Caption(text="DATE OF BIRTH"))
+        self.input_dob = Field(hint_text="DD/MM/YYYY", font_size="13sp")
         dob_col.add_widget(self.input_dob)
-        row_cols.add_widget(dob_col)
+        gen_col = BoxLayout(orientation="vertical", spacing=dp(2))
+        gen_col.add_widget(Caption(text="GENDER"))
+        self.input_gender = Spinner(text=GENDER_HINT, values=GENDERS, font_size="13sp",
+                                    size_hint_y=None, height=dp(44), background_normal="",
+                                    background_down="", background_color=FIELD)
+        gen_col.add_widget(self.input_gender)
+        row.add_widget(dob_col)
+        row.add_widget(gen_col)
+        form.add_widget(row)
 
-        gender_col = BoxLayout(orientation="vertical", spacing=dp(2))
-        gender_col.add_widget(self._field_label("GENDER"))
-        self.input_gender = TextInput(
-            hint_text="MALE / FEMALE", multiline=False,
-            size_hint_y=None, height=dp(40), font_size="13sp",
-            background_color=(0.14, 0.18, 0.28, 1),
-            foreground_color=(1, 1, 1, 1)
-        )
-        gender_col.add_widget(self.input_gender)
-        row_cols.add_widget(gender_col)
-        form_card.add_widget(row_cols)
-        content.add_widget(form_card)
+        mask_row = BoxLayout(size_hint_y=None, height=dp(36), spacing=dp(6))
+        self.mask_box = CheckBox(size_hint=(None, 1), width=dp(36), active=False)
+        mask_row.add_widget(self.mask_box)
+        mask_row.add_widget(Caption(text="Mask number in Excel (XXXX XXXX 1234)", height=dp(36)))
+        form.add_widget(mask_row)
 
-        privacy_note = Label(
-            text="Review every extracted field before saving. Keep identity data private.",
-            font_size="11sp", color=(0.72, 0.76, 0.84, 1),
-            size_hint_y=None, height=dp(34),
-            halign="left", valign="middle"
-        )
-        privacy_note.bind(size=privacy_note.setter("text_size"))
-        content.add_widget(privacy_note)
-
+        content.add_widget(form)
         scroll.add_widget(content)
-        root.add_widget(scroll)
+        return scroll
 
-        # Actions remain fixed at the bottom
-        actions = BoxLayout(
-            orientation="vertical", spacing=dp(8),
-            size_hint_y=None, height=dp(102)
-        )
-        row_inputs = GridLayout(
-            cols=2, spacing=dp(8), size_hint_y=None, height=dp(44)
-        )
-        btn_cam = self._button("Live Camera", (0.38, 0.40, 0.95, 1))
-        btn_cam.bind(on_press=self.open_camera_view)
-        row_inputs.add_widget(btn_cam)
+    def _build_actions(self):
+        box = BoxLayout(orientation="vertical", spacing=dp(8), size_hint_y=None, height=dp(100))
+        row1 = GridLayout(cols=2, spacing=dp(8), size_hint_y=None, height=dp(44))
+        self.btn_cam = FlatButton(text="Camera", bg=ACCENT, on_release=self.open_camera_view)
+        self.btn_gal = FlatButton(text="Gallery", bg=MUTED, on_release=self.open_gallery)
+        row1.add_widget(self.btn_cam)
+        row1.add_widget(self.btn_gal)
+        row2 = GridLayout(cols=2, spacing=dp(8), size_hint_y=None, height=dp(48))
+        self.btn_add = FlatButton(text="Add to list", bg=MUTED, on_release=self.add_to_list)
+        self.btn_export = FlatButton(text="Export Excel", bg=GREEN,
+                                     on_release=self.export_to_excel)
+        row2.add_widget(self.btn_add)
+        row2.add_widget(self.btn_export)
+        box.add_widget(row1)
+        box.add_widget(row2)
+        self._action_buttons = [self.btn_cam, self.btn_gal, self.btn_add, self.btn_export]
+        return box
 
-        btn_files = self._button("Select Image", (0.25, 0.30, 0.45, 1))
-        btn_files.bind(on_press=self.open_file_selector)
-        row_inputs.add_widget(btn_files)
-        actions.add_widget(row_inputs)
-
-        self.btn_export = self._button(
-            "Export to Excel (.xlsx)", (0.06, 0.62, 0.43, 1),
-            height=dp(46)
-        )
-        self.btn_export.bind(on_press=self.export_to_excel)
-        actions.add_widget(self.btn_export)
-        root.add_widget(actions)
-        return root
-
-    def _button(self, text, color, width=None, height=None):
-        kwargs = {
-            "text": text,
-            "background_normal": "",
-            "background_color": color,
-            "font_size": "13sp",
-            "bold": True,
-        }
-        if width is not None:
-            kwargs["size_hint_x"] = None
-            kwargs["width"] = width
-        if height is not None:
-            kwargs["size_hint_y"] = None
-            kwargs["height"] = height
-        return Button(**kwargs)
-
-    def _field_label(self, text):
-        return Label(
-            text=text, font_size="11sp",
-            color=(0.6, 0.7, 0.85, 1),
-            size_hint_y=None, height=dp(16),
-            halign="left", valign="middle"
-        )
-
-    def _add_field(self, parent, label, hint):
-        parent.add_widget(self._field_label(label))
-        field = TextInput(
-            hint_text=hint, multiline=False,
-            size_hint_y=None, height=dp(40), font_size="14sp",
-            background_color=(0.14, 0.18, 0.28, 1),
-            foreground_color=(1, 1, 1, 1),
-            cursor_color=(1, 1, 1, 1)
-        )
-        parent.add_widget(field)
-        return field
-
-    def on_start(self):
-        # Do not request broad storage permissions at startup.
-        # Camera permission is requested only when the camera is opened.
-        pass
-
+    # ------------------------------------------------------------ lifecycle
     def on_pause(self):
-        self._stop_camera()
         return True
 
-    def on_resume(self):
-        return None
-
     def on_stop(self):
-        self._stop_camera()
-
-    def _update_bg(self, instance, _value):
-        self.bg_rect.size = instance.size
-        self.bg_rect.pos = instance.pos
-
-    def get_app_storage_dir(self):
-        """Return a writable app-specific directory."""
-        if platform == "android":
+        self._purge_temp()
+        if self._recognizer is not None:
             try:
-                from android.storage import app_storage_path
-                path = app_storage_path()
-                if path:
-                    os.makedirs(path, exist_ok=True)
-                    return path
+                self._recognizer.close()
             except Exception:
                 pass
-        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app_data")
+
+    def _on_keyboard(self, _window, key, *_args):
+        if key == 27 and self._popup is not None:      # Android back / Esc
+            self._popup.dismiss()
+            return True
+        return False
+
+    # ------------------------------------------------------------ small UI helpers
+    def toast(self, text, error=False, duration=2.6):
+        t = Toast(text, error=error)
+        t.opacity = 0
+        self.root_float.add_widget(t)
+        Animation(opacity=1, duration=0.15).start(t)
+
+        def hide(_dt):
+            anim = Animation(opacity=0, duration=0.3)
+            anim.bind(on_complete=lambda *_: self.root_float.remove_widget(t))
+            anim.start(t)
+
+        Clock.schedule_once(hide, duration)
+
+    def set_status(self, text, error=False):
+        self.status.text = text
+        self.status.color = (1, 0.55, 0.55, 1) if error else DIM
+
+    def _set_busy(self, busy, text=""):
+        self._busy = busy
+        for btn in self._action_buttons:
+            btn.disabled = busy
+        if self._dots_event is not None:
+            self._dots_event.cancel()
+            self._dots_event = None
+        if busy:
+            self._status_base = text
+            self._dot_count = 0
+            self.set_status(text)
+            self._dots_event = Clock.schedule_interval(self._tick, 0.35)
+        elif text:
+            self.set_status(text)
+
+    def _tick(self, _dt):
+        self._dot_count = (self._dot_count + 1) % 4
+        self.status.text = self._status_base + "." * self._dot_count
+
+    def _open_popup(self, popup):
+        self._popup = popup
+        popup.bind(on_dismiss=self._popup_closed)
+        popup.open()
+
+    def _popup_closed(self, popup):
+        if self._popup is popup:
+            self._popup = None
+
+    def show_message(self, title, message):
+        body = BoxLayout(orientation="vertical", padding=dp(14), spacing=dp(10))
+        lbl = Label(text=message, font_size="13sp", halign="center", valign="middle")
+        lbl.bind(size=lambda inst, size: setattr(inst, "text_size", size))
+        body.add_widget(lbl)
+        ok = FlatButton(text="OK", size_hint_y=None, height=dp(44))
+        body.add_widget(ok)
+        popup = Popup(title=title, content=body, size_hint=(0.9, 0.4))
+        ok.bind(on_release=popup.dismiss)
+        self._open_popup(popup)
+
+    def _refresh_counts(self):
+        n = len(self.records)
+        self.btn_list.text = f"List ({n})"
+        self.btn_export.text = f"Export Excel ({n})" if n else "Export Excel"
+
+    # ------------------------------------------------------------ files / temp
+    def _cache_dir(self):
+        path = os.path.join(self.user_data_dir, "scan_cache")
         os.makedirs(path, exist_ok=True)
         return path
 
-    def _request_camera_permission(self, on_granted):
-        if platform != "android":
-            on_granted()
-            return
+    def _export_dir(self):
+        if not IS_ANDROID:
+            downloads = os.path.join(os.path.expanduser("~"), "Downloads")
+            if os.path.isdir(downloads):
+                return downloads
+        path = os.path.join(self.user_data_dir, "exports")
+        os.makedirs(path, exist_ok=True)
+        return path
+
+    def _track_temp(self, path):
+        if path and path not in self._temp_files:
+            self._temp_files.append(path)
+
+    def _discard(self, path):
         try:
-            from android.permissions import request_permissions, Permission, check_permission
-            if check_permission(Permission.CAMERA):
-                on_granted()
-                return
-
-            def permission_callback(_permissions, grant_results):
-                granted = bool(grant_results) and all(bool(v) for v in grant_results)
-                if granted:
-                    Clock.schedule_once(lambda _dt: on_granted(), 0)
-                else:
-                    Clock.schedule_once(
-                        lambda _dt: self.show_popup(
-                            "Camera permission",
-                            "Camera permission was denied. You can still select an image."
-                        ), 0
-                    )
-
-            request_permissions([Permission.CAMERA], permission_callback)
-        except Exception as exc:
-            self.show_popup(
-                "Camera unavailable",
-                "Could not request camera permission. Check Android permissions.\n"
-                + str(exc)
-            )
-
-    def open_camera_view(self, _instance=None):
-        if self._ocr_running:
-            self.show_popup("Please wait", "Wait for the current scan to finish.")
-            return
-        self._request_camera_permission(self._create_camera_popup)
-
-    def _create_camera_popup(self):
-        cam_layout = BoxLayout(
-            orientation="vertical", padding=dp(10), spacing=dp(10)
-        )
-        try:
-            # Resolution is a request; the camera provider/device may choose another.
-            self.camera_widget = Camera(
-                play=True, resolution=(1280, 720), index=0
-            )
-            cam_layout.add_widget(self.camera_widget)
-        except Exception as exc:
-            self.camera_widget = None
-            self.show_popup("Camera error", f"Could not initialize the camera.\n{exc}")
-            return
-
-        btn_row = BoxLayout(
-            size_hint_y=None, height=dp(48), spacing=dp(10)
-        )
-        btn_capture = self._button(
-            "Capture & Scan", (0.38, 0.40, 0.95, 1)
-        )
-        btn_close = self._button("Close", (0.3, 0.3, 0.3, 1))
-        btn_row.add_widget(btn_capture)
-        btn_row.add_widget(btn_close)
-        cam_layout.add_widget(btn_row)
-
-        popup = Popup(
-            title="Align the document and capture",
-            content=cam_layout, size_hint=(0.96, 0.88),
-            auto_dismiss=False
-        )
-        self.camera_popup = popup
-
-        def close_camera(*_args):
-            self._stop_camera()
-            if popup.parent:
-                popup.dismiss()
-
-        def capture(_btn):
-            camera = self.camera_widget
-            if camera is None or camera.texture is None:
-                self.show_popup(
-                    "Camera not ready",
-                    "Wait until the camera preview appears, then try again."
-                )
-                return
-            try:
-                filename = "scan_{}.png".format(
-                    datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                )
-                path = os.path.join(self.get_app_storage_dir(), filename)
-                camera.export_to_png(path)
-                if not os.path.isfile(path) or os.path.getsize(path) == 0:
-                    raise IOError("The camera did not produce an image.")
-                close_camera()
-                self.process_image_path(path)
-            except Exception as exc:
-                self.status_label.text = "Capture failed."
-                self.show_popup("Capture error", str(exc))
-
-        btn_capture.bind(on_press=capture)
-        btn_close.bind(on_press=close_camera)
-        popup.bind(on_dismiss=lambda *_args: self._stop_camera())
-        popup.open()
-
-    def _stop_camera(self):
-        try:
-            if self.camera_widget is not None:
-                self.camera_widget.play = False
-        except Exception:
+            os.remove(path)
+        except OSError:
             pass
-        self.camera_widget = None
-        self.camera_popup = None
+        if path in self._temp_files:
+            self._temp_files.remove(path)
 
-    def open_file_selector(self, _instance=None):
-        if self._ocr_running:
-            self.show_popup("Please wait", "Wait for the current scan to finish.")
+    def _purge_temp(self):
+        for path in list(self._temp_files):
+            self._discard(path)
+
+    # ------------------------------------------------------------ form handling
+    def _on_aadhaar_text(self, inst, value):
+        digits = digits_only(value)[:12]
+        pretty = format_aadhaar(digits)
+        if pretty != value:
+            inst.text = pretty
+            Clock.schedule_once(lambda _dt: setattr(inst, "cursor", (len(pretty), 0)), 0)
+            return
+        if not digits:
+            self.validity.text = ""
+        elif len(digits) < 12:
+            self.validity.text = f"{len(digits)}/12 digits"
+        elif is_valid_aadhaar(digits):
+            self.validity.text = "[color=34d399]Checksum valid[/color]"
+        else:
+            self.validity.text = "[color=fbbf24]Checksum failed - re-check the digits[/color]"
+
+    def _fill_form(self, parsed):
+        self.input_name.text = parsed.get("name") or ""
+        self.input_aadhaar.text = parsed.get("aadhaar_number") or ""
+        self.input_dob.text = parsed.get("dob") or ""
+        gender = parsed.get("gender") or ""
+        self.input_gender.text = gender if gender in GENDERS else GENDER_HINT
+
+    def _current_record(self):
+        digits = digits_only(self.input_aadhaar.text)
+        name = self.input_name.text.strip()
+        if not digits and not name:
+            return None
+        gender = self.input_gender.text
+        return {
+            "aadhaar": format_aadhaar(digits),
+            "name": name,
+            "dob": self.input_dob.text.strip(),
+            "gender": gender if gender in GENDERS else "",
+            "scanned_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+    def clear_form(self, *_):
+        self._fill_form({})
+        self.img_preview.source = ""
+        self.preview_hint.opacity = 1
+        self._purge_temp()
+        if not self._busy:
+            self.set_status("Tap Camera or Gallery to scan a card")
+
+    def add_to_list(self, *_, quiet=False):
+        rec = self._current_record()
+        if rec is None:
+            if not quiet:
+                self.toast("Nothing to add yet - scan a card or type the details")
+            return False
+        key = (digits_only(rec["aadhaar"]), rec["name"].lower())
+        if any((digits_only(r["aadhaar"]), r["name"].lower()) == key for r in self.records):
+            if not quiet:
+                self.toast("Already in the list")
+            return True
+        self.records.append(rec)
+        self._refresh_counts()
+        self.clear_form()
+        if not quiet:
+            warn = ""
+            if rec["aadhaar"] and not is_valid_aadhaar(rec["aadhaar"]):
+                warn = " (checksum failed - please verify)"
+            self.toast(f"Added - {len(self.records)} in list{warn}")
+        return True
+
+    def show_records(self, *_):
+        body = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(10))
+        popup = Popup(title=f"Scanned cards ({len(self.records)})", content=body,
+                      size_hint=(0.95, 0.8))
+        if not self.records:
+            body.add_widget(Label(text="No cards in the list yet.\nScan one and tap 'Add to list'.",
+                                  halign="center", font_size="13sp", color=DIM))
+        else:
+            sv = ScrollView(do_scroll_x=False)
+            grid = GridLayout(cols=1, spacing=dp(6), size_hint_y=None)
+            grid.bind(minimum_height=grid.setter("height"))
+            for i, rec in enumerate(self.records):
+                row = BoxLayout(size_hint_y=None, height=dp(50), spacing=dp(6))
+                text = (f"{i + 1}. {rec['name'] or '(no name)'}\n"
+                        f"[size=11sp][color=9fb3d9]{mask_aadhaar(rec['aadhaar'])}[/color][/size]")
+                lbl = Label(text=text, markup=True, halign="left", valign="middle",
+                            font_size="13sp")
+                lbl.bind(size=lambda inst, size: setattr(inst, "text_size", size))
+                row.add_widget(lbl)
+                row.add_widget(FlatButton(
+                    text="Delete", size_hint=(None, 1), width=dp(66), bg=RED, font_size="11sp",
+                    on_release=lambda _b, idx=i: self._delete_record(idx, popup)))
+                grid.add_widget(row)
+            sv.add_widget(grid)
+            body.add_widget(sv)
+
+        buttons = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(8))
+        if self.records:
+            buttons.add_widget(FlatButton(text="Clear all", bg=RED,
+                                          on_release=lambda _b: self._clear_records(popup)))
+        close = FlatButton(text="Close", bg=MUTED)
+        close.bind(on_release=popup.dismiss)
+        buttons.add_widget(close)
+        body.add_widget(buttons)
+        self._open_popup(popup)
+
+    def _delete_record(self, idx, popup):
+        if 0 <= idx < len(self.records):
+            del self.records[idx]
+        self._refresh_counts()
+        popup.dismiss(animation=False)
+        self.show_records()
+
+    def _clear_records(self, popup):
+        self.records.clear()
+        self._refresh_counts()
+        popup.dismiss()
+
+    # ------------------------------------------------------------ input: camera
+    def _with_camera_permission(self, then):
+        if not IS_ANDROID:
+            then()
             return
         try:
-            from kivy.uix.filechooser import FileChooserListView
-            chooser = FileChooserListView(
-                path=self.get_app_storage_dir(),
-                filters=["*.png", "*.jpg", "*.jpeg", "*.webp", "*.bmp"]
-            )
-        except Exception as exc:
-            self.show_popup("File picker error", str(exc))
+            from android.permissions import Permission, check_permission, request_permissions
+        except Exception as exc:                      # pragma: no cover
+            Logger.warning(f"AadhaarScan: permissions API unavailable: {exc}")
+            then()
+            return
+        if check_permission(Permission.CAMERA):
+            then()
             return
 
-        popup_layout = BoxLayout(
-            orientation="vertical", padding=dp(10), spacing=dp(10)
-        )
-        popup_layout.add_widget(chooser)
-        btn_row = BoxLayout(
-            size_hint_y=None, height=dp(44), spacing=dp(10)
-        )
-        btn_select = self._button("Select", (0.38, 0.40, 0.95, 1))
-        btn_cancel = self._button("Cancel", (0.3, 0.3, 0.3, 1))
-        btn_row.add_widget(btn_select)
-        btn_row.add_widget(btn_cancel)
-        popup_layout.add_widget(btn_row)
-        popup = Popup(
-            title="Select an image",
-            content=popup_layout, size_hint=(0.96, 0.88)
-        )
+        def on_result(_perms, grants):
+            if grants and all(grants):
+                Clock.schedule_once(lambda _dt: then())
+            else:
+                Clock.schedule_once(lambda _dt: self.toast(
+                    "Camera permission denied - use Gallery instead", error=True))
 
-        def select_file(_btn):
-            if not chooser.selection:
-                self.show_popup("Select image", "Choose an image first.")
-                return
-            selected_path = chooser.selection[0]
-            if not os.path.isfile(selected_path):
-                self.show_popup(
-                    "Image unavailable",
-                    "This picker can only open a local file path. "
-                    "On some Android versions, use an app-private copy or add native Photo Picker support."
-                )
+        request_permissions([Permission.CAMERA], on_result)
+
+    def open_camera_view(self, *_):
+        if self._busy:
+            return
+        self._with_camera_permission(self._show_camera)
+
+    def _show_camera(self):
+        try:
+            view = CameraView(rotation=CAMERA_ROTATION, resolution=CAMERA_RESOLUTION)
+        except Exception as exc:
+            Logger.exception("AadhaarScan: camera init failed")
+            self.toast(f"Camera unavailable: {exc}", error=True)
+            return
+
+        body = BoxLayout(orientation="vertical", padding=dp(8), spacing=dp(8))
+        body.add_widget(view)
+        body.add_widget(Caption(text="Fit the card inside the frame and hold steady",
+                                halign="center", height=dp(20)))
+        buttons = BoxLayout(size_hint_y=None, height=dp(48), spacing=dp(10))
+        capture = FlatButton(text="Capture", bg=ACCENT, font_size="14sp")
+        close = FlatButton(text="Close", bg=MUTED)
+        buttons.add_widget(capture)
+        buttons.add_widget(close)
+        body.add_widget(buttons)
+
+        popup = Popup(title="Scan Aadhaar card", content=body, size_hint=(0.96, 0.9),
+                      auto_dismiss=False)
+        popup.bind(on_dismiss=lambda *_: view.stop())
+
+        def do_capture(*_):
+            path = os.path.join(self._cache_dir(), f"snap_{stamp()}.png")
+            try:
+                view.snapshot(path)
+            except Exception as exc:
+                self.toast(str(exc), error=True)
                 return
             popup.dismiss()
-            self.process_image_path(selected_path)
+            self.process_image_path(path, owned=True, rotate=view.rotation)
 
-        btn_select.bind(on_press=select_file)
-        btn_cancel.bind(on_press=popup.dismiss)
-        popup.open()
+        capture.bind(on_release=do_capture)
+        close.bind(on_release=popup.dismiss)
+        self._open_popup(popup)
+        Clock.schedule_once(lambda _dt: view.start(), 0.15)
 
-    def load_sample(self, _instance=None):
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        candidates = [
-            os.path.join(base_dir, "sample_aadhaar.png"),
-            os.path.join(base_dir, "Screenshot 2026-10-28 133028.png"),
-        ]
-        sample_path = next((p for p in candidates if os.path.isfile(p)), None)
-        if not sample_path:
-            self.show_popup(
-                "Sample image not found",
-                "Place sample_aadhaar.png beside this Python file, or select a real image."
-            )
+    # ------------------------------------------------------------ input: gallery / files
+    def open_gallery(self, *_):
+        if self._busy:
             return
-        self.process_image_path(sample_path)
-
-    def process_image_path(self, path: str):
-        if self._ocr_running:
-            self.show_popup("Please wait", "A scan is already running.")
-            return
-        if not path or not os.path.isfile(path):
-            self.show_popup("Image error", "The selected image could not be found.")
-            return
-
-        extension = os.path.splitext(path)[1].lower()
-        if extension not in {".png", ".jpg", ".jpeg", ".webp", ".bmp"}:
-            self.show_popup("Unsupported file", "Choose a PNG, JPG, JPEG, WEBP, or BMP image.")
-            return
-
-        try:
-            if os.path.getsize(path) > 40 * 1024 * 1024:
-                self.show_popup(
-                    "Image too large",
-                    "This image is larger than 40 MB. Choose a smaller image."
-                )
+        if IS_ANDROID:
+            try:
+                from androidstorage4kivy import Chooser
+                self._chooser = Chooser(self._on_gallery_result)
+                self._chooser.choose_content("image/*")
                 return
-        except OSError:
-            self.show_popup("Image error", "Could not read the selected image.")
-            return
+            except Exception as exc:
+                Logger.warning(f"AadhaarScan: system picker unavailable ({exc}); using fallback")
+                self.toast("Gallery picker not installed - using file browser")
+        self._open_file_chooser()
 
-        self._ocr_running = True
-        self._scan_id += 1
-        scan_id = self._scan_id
-        self.current_image_path = path
+    def _on_gallery_result(self, uris):
+        if not uris:
+            return
+        uri = uris[0]
+
+        def load():
+            from androidstorage4kivy import SharedStorage
+            return SharedStorage().copy_from_shared(uri)
+
+        Clock.schedule_once(lambda _dt: self._run_scan(load, owned=True))
+
+    def _open_file_chooser(self):
+        from kivy.uix.filechooser import FileChooserListView
+        start = self.user_data_dir if IS_ANDROID else os.path.expanduser("~")
+        chooser = FileChooserListView(path=start, filters=["*.png", "*.jpg", "*.jpeg", "*.webp"])
+        body = BoxLayout(orientation="vertical", padding=dp(10), spacing=dp(10))
+        body.add_widget(chooser)
+        buttons = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(10))
+        select = FlatButton(text="Select", bg=ACCENT)
+        cancel = FlatButton(text="Cancel", bg=MUTED)
+        buttons.add_widget(select)
+        buttons.add_widget(cancel)
+        body.add_widget(buttons)
+        popup = Popup(title="Select Aadhaar image", content=body, size_hint=(0.95, 0.88))
+
+        def on_select(*_):
+            if chooser.selection:
+                path = chooser.selection[0]
+                popup.dismiss()
+                self.process_image_path(path)
+
+        select.bind(on_release=on_select)
+        cancel.bind(on_release=popup.dismiss)
+        self._open_popup(popup)
+
+    def load_sample(self, *_):
+        if os.path.exists(SAMPLE_PATH):
+            self.process_image_path(SAMPLE_PATH)
+        else:
+            self.toast("Sample image not found", error=True)
+
+    # ------------------------------------------------------------ scanning pipeline
+    def process_image_path(self, path, owned=False, rotate=0):
+        """owned=True means we created `path` (camera/gallery copy), so it gets deleted after use."""
+        self._run_scan(lambda: path, owned=owned, rotate=rotate)
+
+    def _run_scan(self, loader, owned=False, rotate=0):
+        if self._busy:
+            return
+        self._purge_temp()
+        self._set_busy(True, "Preparing image")
+        threading.Thread(target=self._scan_worker, args=(loader, owned, rotate),
+                         daemon=True).start()
+
+    def _scan_worker(self, loader, owned, rotate):
+        """Runs off the UI thread. Only touch widgets via Clock.schedule_once."""
+        try:
+            src = loader()
+            if not src or not os.path.exists(src):
+                raise FileNotFoundError("Image file not found")
+            if owned:
+                self._track_temp(src)
+            prepared = prepare_image(src, self._cache_dir(), rotate_deg=rotate)
+            if prepared != src:
+                self._track_temp(prepared)
+                if owned:
+                    self._discard(src)          # drop the big original right away
+            Clock.schedule_once(lambda _dt: self._show_preview(prepared))
+            Clock.schedule_once(lambda _dt: self._update_busy_text("Reading text"))
+            lines = self._recognise(prepared)
+            parsed = parse_aadhaar_text(lines)
+            Clock.schedule_once(lambda _dt: self._on_scan_done(parsed, len(lines)))
+        except Exception as exc:
+            Logger.exception("AadhaarScan: scan failed")
+            message = str(exc) or exc.__class__.__name__
+            Clock.schedule_once(lambda _dt: self._on_scan_error(message))
+
+    def _update_busy_text(self, text):
+        if self._busy:
+            self._status_base = text
+
+    def _show_preview(self, path):
         self.img_preview.source = path
         self.img_preview.reload()
-        self.status_label.text = "Processing image… please wait."
-        self.btn_export.disabled = True
+        self.preview_hint.opacity = 0
 
-        worker = threading.Thread(
-            target=self._ocr_worker,
-            args=(path, scan_id),
-            daemon=True
-        )
-        worker.start()
+    def _on_scan_done(self, parsed, line_count):
+        self._set_busy(False)
+        self._fill_form(parsed)
+        if parsed["aadhaar_number"] or parsed["name"]:
+            self.set_status("Scan complete - please review the fields")
+        elif line_count == 0:
+            self.set_status("No text found. Try better light and hold steady.", error=True)
+        else:
+            self.set_status("Text found but no card details detected - fill in manually.",
+                            error=True)
 
-    def _ocr_worker(self, path: str, scan_id: int):
-        """Background worker. Do not touch Kivy widgets in this method."""
-        lines: List[str] = []
-        error_message = ""
-        try:
-            if platform == "android":
-                lines = self._run_mlkit_ocr(path)
-            else:
-                try:
-                    from aadhaar_ocr import AadhaarOCR
-                    ocr = AadhaarOCR(
-                        languages=["en", "hi"], use_gpu=False, verbose=False
-                    )
-                    extracted = ocr.extract_text(path)
-                    if extracted:
-                        lines = [
-                            str(line).strip()
-                            for line in extracted
-                            if str(line).strip()
-                        ]
-                except Exception as exc:
-                    error_message = (
-                        "Desktop OCR is unavailable. Install/configure "
-                        "aadhaar_ocr and its OCR dependencies. Details: "
-                        + str(exc)
-                    )
-        except Exception as exc:
-            # Keep personal document contents out of logs.
-            error_message = "OCR failed: " + str(exc)
+    def _on_scan_error(self, message):
+        self._set_busy(False)
+        self.set_status("Scan failed", error=True)
+        self.toast(message, error=True, duration=4)
 
-        parsed = self.parse_aadhaar_text(lines)
-        Clock.schedule_once(
-            lambda _dt: self._finish_ocr(scan_id, parsed, error_message), 0
-        )
+    # ------------------------------------------------------------ OCR engines
+    def _recognise(self, path: str) -> List[str]:
+        return self._mlkit_lines(path) if IS_ANDROID else self._desktop_lines(path)
 
-    def _run_mlkit_ocr(self, path: str) -> List[str]:
-        """Run ML Kit synchronously inside the worker thread, not the UI thread."""
+    def _mlkit_lines(self, path: str) -> List[str]:
         from jnius import autoclass
-
         BitmapFactory = autoclass("android.graphics.BitmapFactory")
         InputImage = autoclass("com.google.mlkit.vision.common.InputImage")
-        TextRecognition = autoclass("com.google.mlkit.vision.text.TextRecognition")
-        Options = autoclass(
-            "com.google.mlkit.vision.text.latin.TextRecognizerOptions"
-        )
+        TimeUnit = autoclass("java.util.concurrent.TimeUnit")
         Tasks = autoclass("com.google.android.gms.tasks.Tasks")
 
         bitmap = BitmapFactory.decodeFile(path)
         if bitmap is None:
-            raise ValueError("Android could not decode this image.")
-
-        recognizer = None
+            raise RuntimeError("Could not decode the image")
         try:
-            input_image = InputImage.fromBitmap(bitmap, 0)
-            recognizer = TextRecognition.getClient(Options.DEFAULT_OPTIONS)
-            await_method = getattr(Tasks, "await")
-            vision_text = await_method(recognizer.process(input_image))
-            text = str(vision_text.getText())
-            return [line.strip() for line in text.splitlines() if line.strip()]
+            if self._recognizer is None:             # create once, reuse for every scan
+                TextRecognition = autoclass("com.google.mlkit.vision.text.TextRecognition")
+                Options = autoclass("com.google.mlkit.vision.text.latin.TextRecognizerOptions")
+                self._recognizer = TextRecognition.getClient(Options.DEFAULT_OPTIONS)
+            task = self._recognizer.process(InputImage.fromBitmap(bitmap, 0))
+            # We're on a worker thread, so blocking here is fine - with a timeout.
+            result = getattr(Tasks, "await")(task, 20, TimeUnit.SECONDS)
+            text = result.getText() or ""
         finally:
-            if recognizer is not None:
-                try:
-                    recognizer.close()
-                except Exception:
-                    pass
-            try:
-                bitmap.recycle()
-            except Exception:
-                pass
+            bitmap.recycle()
+        return [ln.strip() for ln in text.split("\n") if ln.strip()]
 
-    def _finish_ocr(self, scan_id: int, parsed: Dict[str, Any], error_message: str):
-        """Runs on Kivy's main thread."""
-        if scan_id != self._scan_id:
-            return
-        self._ocr_running = False
-        self.btn_export.disabled = False
-
-        if error_message and not any(parsed.values()):
-            self.status_label.text = "Could not extract text. You can enter details manually."
-            self.show_popup("OCR problem", error_message)
-            return
-
-        self.input_name.text = parsed.get("name", "")
-        self.input_aadhaar.text = parsed.get("aadhaar_number", "")
-        self.input_dob.text = parsed.get("dob", "")
-        self.input_gender.text = parsed.get("gender", "")
-
-        if any(parsed.values()):
-            self.status_label.text = "OCR finished. Review and correct every field."
-        elif error_message:
-            self.status_label.text = "Image loaded, but OCR was unavailable."
-        else:
-            self.status_label.text = "No reliable fields found. Enter or correct them manually."
-
-    def parse_aadhaar_text(self, lines: List[str]) -> Dict[str, Any]:
-        full_text = " \n ".join(lines)
-        data: Dict[str, Any] = {
-            "aadhaar_number": "", "name": "", "dob": "", "gender": ""
-        }
-
-        # Find candidate 12-digit numbers with flexible whitespace.
-        digit_candidates = re.findall(
-            r"(?<!\d)(?:\d[\s\-]?){11}\d(?!\d)", full_text
-        )
-        if digit_candidates:
-            for candidate in digit_candidates:
-                digits = re.sub(r"\D", "", candidate)
-                if len(digits) == 12:
-                    data["aadhaar_number"] = (
-                        f"{digits[:4]} {digits[4:8]} {digits[8:]}"
-                    )
-                    break
-
-        # Prefer a labeled full DOB; accept year of birth as a year only.
-        dob_patterns = [
-            r"(?:DOB|D\.O\.B|Date\s*of\s*Birth|जन्म\s*तिथि|जन्म\s*तारीख)"
-            r"[\s:\-]*(\d{2}[/\-\.]\d{2}[/\-\.]\d{4})",
-            r"\b(\d{2}[/\-\.]\d{2}[/\-\.]\d{4})\b",
-        ]
-        for pattern in dob_patterns:
-            match = re.search(pattern, full_text, re.IGNORECASE)
-            if match:
-                raw = match.group(1).replace("-", "/").replace(".", "/")
-                try:
-                    datetime.datetime.strptime(raw, "%d/%m/%Y")
-                    data["dob"] = raw
-                except ValueError:
-                    pass
-                if data["dob"]:
-                    break
-        if not data["dob"]:
-            year_match = re.search(
-                r"(?:Year\s*of\s*Birth|जन्म\s*वर्ष)[\s:\-]*(\d{4})\b",
-                full_text, re.IGNORECASE
-            )
-            if year_match:
-                year = int(year_match.group(1))
-                if 1900 <= year <= datetime.datetime.now().year:
-                    data["dob"] = str(year)
-
-        # Check FEMALE before MALE to avoid partial-word confusion.
-        if re.search(r"\b(FEMALE|महिला)\b", full_text, re.IGNORECASE):
-            data["gender"] = "FEMALE"
-        elif re.search(r"\b(MALE|पुरुष)\b", full_text, re.IGNORECASE):
-            data["gender"] = "MALE"
-        elif re.search(r"\b(TRANSGENDER|उभयलिंगी)\b", full_text, re.IGNORECASE):
-            data["gender"] = "TRANSGENDER"
-
-        # Conservative English-name heuristic. User should always verify it.
-        ignore = (
-            "government", "india", "bharat", "sarkar", "unique",
-            "authority", "dob", "male", "female", "aadhaar", "aadhar",
-            "card", "enrollment", "enrolment", "year of birth"
-        )
-        for line in lines:
-            candidate = line.strip()
-            lower = candidate.lower()
-            if any(word in lower for word in ignore):
-                continue
-            if re.search(r"\d", candidate):
-                continue
-            if re.fullmatch(r"[A-Za-z][A-Za-z .'-]{2,39}", candidate):
-                words = candidate.split()
-                if 1 <= len(words) <= 5:
-                    data["name"] = candidate
-                    break
-
-        return data
-
-    def _on_aadhaar_edited(self, _instance, value):
-        # Keep the current value in memory for the show/hide control.
-        self._last_aadhaar_value = value
-
-    def toggle_aadhaar_visibility(self, _instance=None):
-        self._aadhaar_visible = not self._aadhaar_visible
-        self.input_aadhaar.password = not self._aadhaar_visible
-        self.btn_toggle_aadhaar.text = "Hide" if self._aadhaar_visible else "Show"
-
-    def _validate_form(self):
-        name = self.input_name.text.strip()
-        aadhaar_raw = self.input_aadhaar.text.strip()
-        dob = self.input_dob.text.strip()
-        gender = self.input_gender.text.strip().upper()
-
-        digits = re.sub(r"\D", "", aadhaar_raw)
-        if aadhaar_raw and len(digits) != 12:
-            return None, "Aadhaar number should contain exactly 12 digits."
-        if dob:
-            if re.fullmatch(r"\d{4}", dob):
-                year = int(dob)
-                if not (1900 <= year <= datetime.datetime.now().year):
-                    return None, "Please check the year of birth."
-            else:
-                normalized = dob.replace("-", "/").replace(".", "/")
-                try:
-                    datetime.datetime.strptime(normalized, "%d/%m/%Y")
-                except ValueError:
-                    return None, "Date of birth must be a valid DD/MM/YYYY date or a four-digit year."
-                dob = normalized
-        if gender and gender not in {"MALE", "FEMALE", "TRANSGENDER", "OTHER"}:
-            return None, "Gender should be MALE, FEMALE, TRANSGENDER, or OTHER."
-
-        aadhaar_formatted = (
-            f"{digits[:4]} {digits[4:8]} {digits[8:]}" if digits else ""
-        )
-        if not name and not aadhaar_formatted:
-            return None, "Please scan a document or enter a name or Aadhaar number."
-        return {
-            "name": name,
-            "aadhaar_number": aadhaar_formatted,
-            "dob": dob,
-            "gender": gender,
-        }, ""
-
-    def export_to_excel(self, _instance=None):
-        record, validation_error = self._validate_form()
-        if validation_error:
-            self.show_popup("Check details", validation_error)
-            return
-
+    def _desktop_lines(self, path: str) -> List[str]:
         try:
-            wb = openpyxl.Workbook()
-            ws = wb.active
-            ws.title = "Aadhaar Card"
-            headers = [
-                "S.No.", "Aadhaar Number", "Full Name",
-                "Date of Birth", "Gender", "Export Date"
-            ]
-            ws.append(headers)
-            ws.append([
-                1, record["aadhaar_number"], record["name"],
-                record["dob"], record["gender"],
-                datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            ])
+            if self._desktop_ocr is None:
+                from aadhaar_ocr import AadhaarOCR
+                self._desktop_ocr = AadhaarOCR(languages=["en", "hi"], use_gpu=False,
+                                               verbose=False)
+        except ImportError:
+            raise RuntimeError("Desktop OCR module 'aadhaar_ocr' not found - "
+                               "OCR runs on Android only")
+        return self._desktop_ocr.extract_text(path)
 
-            header_fill = PatternFill(
-                start_color="1E293B", end_color="1E293B", fill_type="solid"
-            )
-            header_font = Font(
-                name="Arial", size=11, bold=True, color="FFFFFF"
-            )
-            side = Side(border_style="thin", color="CBD5E1")
-            border = Border(top=side, bottom=side, left=side, right=side)
-            center = Alignment(horizontal="center", vertical="center")
-            left = Alignment(horizontal="left", vertical="center")
+    # ------------------------------------------------------------ export
+    def export_to_excel(self, *_):
+        if self._busy:
+            return
+        if self._current_record() is not None:
+            self.add_to_list(quiet=True)        # include whatever is on screen
+        if not self.records:
+            self.toast("Nothing to export - scan a card or enter details first")
+            return
+        records = [dict(r) for r in self.records]
+        mask = self.mask_box.active
+        self._set_busy(True, "Creating Excel file")
+        threading.Thread(target=self._export_worker, args=(records, mask), daemon=True).start()
 
-            for cell in ws[1]:
-                cell.fill = header_fill
-                cell.font = header_font
-                cell.alignment = center
-                cell.border = border
-
-            for cell in ws[2]:
-                cell.border = border
-                cell.alignment = left if cell.column == 3 else center
-                # Keep identifier values as text, preserving leading zeroes.
-                if cell.column == 2:
-                    cell.number_format = "@"
-
-            ws.freeze_panes = "A2"
-            ws.auto_filter.ref = f"A1:F2"
-            ws.row_dimensions[1].height = 24
-            for column_cells in ws.columns:
-                max_length = max(
-                    len(str(cell.value or "")) for cell in column_cells
-                )
-                ws.column_dimensions[
-                    column_cells[0].column_letter
-                ].width = min(max(max_length + 4, 12), 34)
-
-            filename = "Aadhaar_Data_{}.xlsx".format(
-                datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            )
-            export_dir = self.get_app_storage_dir()
-            export_path = os.path.join(export_dir, filename)
-            wb.save(export_path)
-            wb.close()
-
-            self.show_popup(
-                "Export successful",
-                "Excel file saved in the app's storage:\n\n"
-                + export_path
-                + "\n\nUse your file manager or add Android file-sharing integration to move/share it."
-            )
+    def _export_worker(self, records, mask):
+        try:
+            private = os.path.join(self._export_dir(), f"Aadhaar_Data_{stamp()}.xlsx")
+            export_records(records, private, mask=mask)
+            where = self._publish_file(private)
+            Clock.schedule_once(lambda _dt: self._on_export_done(where, len(records)))
         except Exception as exc:
-            self.show_popup(
-                "Export failed",
-                "Could not save the Excel file. Check available storage and try again.\n\n"
-                + str(exc)
-            )
+            Logger.exception("AadhaarScan: export failed")
+            message = str(exc) or exc.__class__.__name__
+            Clock.schedule_once(lambda _dt: self._on_export_error(message))
 
-    def show_popup(self, title: str, message: str):
-        layout = BoxLayout(
-            orientation="vertical", padding=dp(14), spacing=dp(10)
-        )
-        label = Label(
-            text=message, font_size="13sp",
-            halign="center", valign="middle"
-        )
-        label.bind(size=label.setter("text_size"))
-        layout.add_widget(label)
-        btn_close = self._button(
-            "OK", (0.38, 0.40, 0.95, 1), height=dp(42)
-        )
-        layout.add_widget(btn_close)
-        popup = Popup(
-            title=title, content=layout, size_hint=(0.90, 0.48)
-        )
-        btn_close.bind(on_press=popup.dismiss)
-        popup.open()
+    def _publish_file(self, private_path: str) -> str:
+        """Make the file visible to the user. Returns a readable location."""
+        if IS_ANDROID:
+            try:                                     # Android 10+ (scoped storage) way
+                from androidstorage4kivy import SharedStorage
+                from jnius import autoclass
+                Environment = autoclass("android.os.Environment")
+                SharedStorage().copy_to_shared(private_path,
+                                               collection=Environment.DIRECTORY_DOWNLOADS)
+                where = "Downloads/" + os.path.basename(private_path)
+                self._discard(private_path)
+                return where
+            except Exception as exc:
+                Logger.warning(f"AadhaarScan: shared-storage save failed: {exc}")
+            try:                                     # legacy fallback (Android 9 and below)
+                from android.storage import primary_external_storage_path
+                dest = os.path.join(primary_external_storage_path(), "Download",
+                                    os.path.basename(private_path))
+                shutil.copy2(private_path, dest)
+                os.remove(private_path)
+                return dest
+            except Exception as exc:
+                Logger.warning(f"AadhaarScan: legacy save failed: {exc}")
+        return private_path
+
+    def _on_export_done(self, where, count):
+        self._set_busy(False, "Excel file saved")
+        self.show_message("Export successful", f"{count} record(s) saved to:\n\n{where}")
+
+    def _on_export_error(self, message):
+        self._set_busy(False, "Export failed")
+        self.toast(message, error=True, duration=4)
 
 
 if __name__ == "__main__":

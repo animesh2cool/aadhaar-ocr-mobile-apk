@@ -44,7 +44,7 @@ android.ndk = 25b
 android.archs = arm64-v8a
 
 # (list) Gradle dependencies to add
-android.gradle_dependencies = com.google.mlkit:text-recognition:16.0.0
+android.gradle_dependencies = com.google.mlkit:text-recognition:16.0.0, com.google.mlkit:vision-common:17.3.0, com.google.android.gms:play-services-tasks:18.1.0
 
 # (bool) Enable AndroidX support. Required for Google ML Kit.
 android.enable_androidx = True
