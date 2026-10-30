@@ -35,7 +35,10 @@ android.permissions = CAMERA,READ_EXTERNAL_STORAGE,WRITE_EXTERNAL_STORAGE
 android.api = 33
 
 # (int) Minimum API your APK will support.
-android.minapi = 23
+android.minapi = 24
+
+# (int) Android NDK API to use (API 24 exposes preadv/pwritev in Bionic libc)
+android.ndk_api = 24
 
 # (str) Android NDK version to use
 android.ndk = 25b
