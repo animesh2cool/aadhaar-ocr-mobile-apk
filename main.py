@@ -252,6 +252,16 @@ class AadhaarMobileApp(App):
         self._status_base = ""
         self._action_buttons: List[Button] = []
 
+        # ML Kit and JNI state (resolved on main UI thread)
+        self._mlkit_ready = False
+        self._mlkit_error = None
+        self._app_loader = None
+        self._BitmapFactory = None
+        self._InputImage = None
+        self._TimeUnit = None
+        self._Tasks = None
+        self._Environment = None
+
         self.root_float = FloatLayout()
         main = BoxLayout(orientation="vertical", padding=dp(12), spacing=dp(8))
         main.add_widget(self._build_header())
@@ -262,6 +272,51 @@ class AadhaarMobileApp(App):
         Window.bind(on_keyboard=self._on_keyboard)
         self._refresh_counts()
         return self.root_float
+
+    def on_start(self):
+        if IS_ANDROID:
+            Clock.schedule_once(lambda _dt: self._init_android_services(), 0.3)
+
+    def _init_android_services(self):
+        try:
+            self._init_mlkit()
+        except Exception as exc:
+            Logger.exception(f"AadhaarScan: Android init error: {exc}")
+
+    def _init_mlkit(self) -> bool:
+        """Pre-load all ML Kit and Android classes on the MAIN thread so PyJNIus caches them."""
+        if not IS_ANDROID:
+            return True
+        if self._mlkit_ready and self._recognizer is not None:
+            return True
+        try:
+            from jnius import autoclass
+            PythonActivity = autoclass("org.kivy.android.PythonActivity")
+            activity = PythonActivity.mActivity
+            if activity:
+                self._app_loader = activity.getClassLoader()
+                Thread = autoclass("java.lang.Thread")
+                Thread.currentThread().setContextClassLoader(self._app_loader)
+
+            self._BitmapFactory = autoclass("android.graphics.BitmapFactory")
+            self._InputImage = autoclass("com.google.mlkit.vision.common.InputImage")
+            self._TimeUnit = autoclass("java.util.concurrent.TimeUnit")
+            self._Tasks = autoclass("com.google.android.gms.tasks.Tasks")
+            TextRecognition = autoclass("com.google.mlkit.vision.text.TextRecognition")
+            Options = autoclass("com.google.mlkit.vision.text.latin.TextRecognizerOptions")
+            self._recognizer = TextRecognition.getClient(Options.DEFAULT_OPTIONS)
+            try:
+                self._Environment = autoclass("android.os.Environment")
+            except Exception:
+                pass
+            self._mlkit_ready = True
+            self._mlkit_error = None
+            Logger.info("AadhaarScan: Google ML Kit loaded successfully on main thread")
+            return True
+        except Exception as exc:
+            Logger.exception("AadhaarScan: ML Kit initialization failed on main thread")
+            self._mlkit_error = str(exc)
+            return False
 
     def _build_header(self):
         header = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(8))
@@ -725,6 +780,10 @@ class AadhaarMobileApp(App):
     def _run_scan(self, loader, owned=False, rotate=0):
         if self._busy:
             return
+        if IS_ANDROID and not self._mlkit_ready:
+            if not self._init_mlkit():
+                self.toast(f"ML Kit unavailable: {self._mlkit_error}", error=True)
+                return
         self._purge_temp()
         self._set_busy(True, "Preparing image")
         threading.Thread(target=self._scan_worker, args=(loader, owned, rotate),
@@ -732,6 +791,13 @@ class AadhaarMobileApp(App):
 
     def _scan_worker(self, loader, owned, rotate):
         """Runs off the UI thread. Only touch widgets via Clock.schedule_once."""
+        if IS_ANDROID and self._app_loader:
+            try:
+                from jnius import autoclass
+                Thread = autoclass("java.lang.Thread")
+                Thread.currentThread().setContextClassLoader(self._app_loader)
+            except Exception as exc:
+                Logger.warning(f"AadhaarScan: could not set worker thread classloader: {exc}")
         try:
             src = loader()
             if not src or not os.path.exists(src):
@@ -783,23 +849,17 @@ class AadhaarMobileApp(App):
         return self._mlkit_lines(path) if IS_ANDROID else self._desktop_lines(path)
 
     def _mlkit_lines(self, path: str) -> List[str]:
-        from jnius import autoclass
-        BitmapFactory = autoclass("android.graphics.BitmapFactory")
-        InputImage = autoclass("com.google.mlkit.vision.common.InputImage")
-        TimeUnit = autoclass("java.util.concurrent.TimeUnit")
-        Tasks = autoclass("com.google.android.gms.tasks.Tasks")
+        if not self._mlkit_ready or self._recognizer is None:
+            raise RuntimeError(f"ML Kit engine not ready: {self._mlkit_error or 'uninitialized'}")
 
-        bitmap = BitmapFactory.decodeFile(path)
+        bitmap = self._BitmapFactory.decodeFile(path)
         if bitmap is None:
             raise RuntimeError("Could not decode the image")
         try:
-            if self._recognizer is None:             # create once, reuse for every scan
-                TextRecognition = autoclass("com.google.mlkit.vision.text.TextRecognition")
-                Options = autoclass("com.google.mlkit.vision.text.latin.TextRecognizerOptions")
-                self._recognizer = TextRecognition.getClient(Options.DEFAULT_OPTIONS)
-            task = self._recognizer.process(InputImage.fromBitmap(bitmap, 0))
+            image = self._InputImage.fromBitmap(bitmap, 0)
+            task = self._recognizer.process(image)
             # We're on a worker thread, so blocking here is fine - with a timeout.
-            result = getattr(Tasks, "await")(task, 20, TimeUnit.SECONDS)
+            result = getattr(self._Tasks, "await")(task, 25, self._TimeUnit.SECONDS)
             text = result.getText() or ""
         finally:
             bitmap.recycle()
@@ -831,6 +891,13 @@ class AadhaarMobileApp(App):
         threading.Thread(target=self._export_worker, args=(records, mask), daemon=True).start()
 
     def _export_worker(self, records, mask):
+        if IS_ANDROID and self._app_loader:
+            try:
+                from jnius import autoclass
+                Thread = autoclass("java.lang.Thread")
+                Thread.currentThread().setContextClassLoader(self._app_loader)
+            except Exception:
+                pass
         try:
             private = os.path.join(self._export_dir(), f"Aadhaar_Data_{stamp()}.xlsx")
             export_records(records, private, mask=mask)
@@ -846,10 +913,12 @@ class AadhaarMobileApp(App):
         if IS_ANDROID:
             try:                                     # Android 10+ (scoped storage) way
                 from androidstorage4kivy import SharedStorage
-                from jnius import autoclass
-                Environment = autoclass("android.os.Environment")
+                env = self._Environment
+                if env is None:
+                    from jnius import autoclass
+                    env = autoclass("android.os.Environment")
                 SharedStorage().copy_to_shared(private_path,
-                                               collection=Environment.DIRECTORY_DOWNLOADS)
+                                               collection=env.DIRECTORY_DOWNLOADS)
                 where = "Downloads/" + os.path.basename(private_path)
                 self._discard(private_path)
                 return where

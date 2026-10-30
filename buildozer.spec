@@ -35,7 +35,7 @@ android.permissions = CAMERA,READ_EXTERNAL_STORAGE,WRITE_EXTERNAL_STORAGE
 android.api = 33
 
 # (int) Minimum API your APK will support.
-android.minapi = 21
+android.minapi = 23
 
 # (str) Android NDK version to use
 android.ndk = 25b
