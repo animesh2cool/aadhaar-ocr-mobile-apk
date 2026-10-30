@@ -236,50 +236,71 @@ def prepare_image(src: str, out_dir: str, max_side: int = 1600, rotate_deg: int 
 # Excel export
 # --------------------------------------------------------------------------
 def export_records(records: List[Dict[str, str]], path: str, mask: bool = False) -> str:
-    import openpyxl  # lazy: keeps app start-up fast
-    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
-    from openpyxl.utils import get_column_letter
+    """Exports records to an Excel (.xlsx) file using XlsxWriter (0 external dependencies)."""
+    import xlsxwriter
 
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "Aadhaar Cards"
+    wb = xlsxwriter.Workbook(path)
+    ws = wb.add_worksheet("Aadhaar Cards")
+
+    header_fmt = wb.add_format({
+        "bold": True,
+        "font_name": "Calibri",
+        "font_size": 11,
+        "font_color": "#FFFFFF",
+        "bg_color": "#1E293B",
+        "align": "center",
+        "valign": "vcenter",
+        "border": 1,
+        "border_color": "#CBD5E1",
+    })
+    cell_center = wb.add_format({
+        "font_name": "Calibri",
+        "font_size": 10,
+        "align": "center",
+        "valign": "vcenter",
+        "border": 1,
+        "border_color": "#CBD5E1",
+        "num_format": "@",
+    })
+    cell_name = wb.add_format({
+        "font_name": "Calibri",
+        "font_size": 10,
+        "align": "left",
+        "valign": "vcenter",
+        "border": 1,
+        "border_color": "#CBD5E1",
+    })
+
     headers = ["S.No.", "Aadhaar Number", "Full Name", "Date of Birth",
                "Gender", "Checksum", "Scanned At"]
-    ws.append(headers)
+    for col_idx, h in enumerate(headers):
+        ws.write(0, col_idx, h, header_fmt)
 
-    for i, rec in enumerate(records, 1):
+    for row_idx, rec in enumerate(records, start=1):
         number = rec.get("aadhaar", "")
         if not number:
             status = ""
         else:
             status = "Valid" if is_valid_aadhaar(number) else "Check digits"
-        ws.append([i, mask_aadhaar(number) if mask else number, rec.get("name", ""),
-                   rec.get("dob", ""), rec.get("gender", ""), status,
-                   rec.get("scanned_at", "")])
 
-    side = Side(border_style="thin", color="CBD5E1")
-    border = Border(top=side, bottom=side, left=side, right=side)
-    center = Alignment(horizontal="center", vertical="center")
-    head_fill = PatternFill(start_color="1E293B", end_color="1E293B", fill_type="solid")
-    head_font = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
+        display_num = mask_aadhaar(number) if mask else number
+        row_data = [
+            (row_idx, cell_center),
+            (display_num, cell_center),
+            (rec.get("name", ""), cell_name),
+            (rec.get("dob", ""), cell_center),
+            (rec.get("gender", ""), cell_center),
+            (status, cell_center),
+            (rec.get("scanned_at", ""), cell_center),
+        ]
+        for col_idx, (val, fmt) in enumerate(row_data):
+            ws.write(row_idx, col_idx, val, fmt)
 
-    for cell in ws[1]:
-        cell.fill, cell.font, cell.alignment, cell.border = head_fill, head_font, center, border
+    col_widths = [8, 20, 26, 16, 12, 16, 22]
+    for idx, w in enumerate(col_widths):
+        ws.set_column(idx, idx, w)
 
-    centered_cols = {1, 2, 4, 5, 6, 7}
-    for row in ws.iter_rows(min_row=2):
-        for cell in row:
-            cell.border = border
-            if cell.column in centered_cols:
-                cell.alignment = center
-            if cell.column in (2, 4):
-                cell.number_format = "@"          # keep as text
-
-    for idx, col in enumerate(ws.columns, 1):
-        longest = max(len(str(c.value or "")) for c in col)
-        ws.column_dimensions[get_column_letter(idx)].width = min(max(longest + 4, 12), 40)
-
-    ws.freeze_panes = "A2"
-    ws.auto_filter.ref = ws.dimensions
-    wb.save(path)
+    ws.freeze_panes(1, 0)
+    ws.autofilter(0, 0, max(len(records), 1), len(headers) - 1)
+    wb.close()
     return path
