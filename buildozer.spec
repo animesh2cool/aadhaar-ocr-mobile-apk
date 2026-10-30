@@ -20,7 +20,10 @@ version = 1.0.0
 
 # (list) Application requirements
 # comma separated e.g. requirements = sqlite3,kivy
-requirements = python3,kivy,pillow,openpyxl,et_xmlfile
+requirements = python3,kivy,pillow,openpyxl,et_xmlfile,charset-normalizer==2.1.1
+
+# (str) python-for-android branch to use
+p4a.branch = develop
 
 # (str) Supported orientation (one of landscape, sensorLandscape, portrait or all)
 orientation = portrait
