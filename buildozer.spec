@@ -1,79 +1,62 @@
 [app]
 
-# (str) Title of your application
+# ---- App identity ----------------------------------------------------------
 title = AadhaarScan
-
-# (str) Package name
 package.name = aadhaarscan
-
-# (str) Package domain (needed for android/ios packaging)
 package.domain = org.kalim.aadhaar
-
-# (str) Source code where the main.py lives
-source.dir = .
-
-# (list) Source files to include (let empty to include all the files)
-source.include_exts = py,png,jpg,kv,atlas,ttf
-
-# (str) Application versioning (method 1)
 version = 1.0.0
 
-# (list) Application requirements
-# comma separated e.g. requirements = sqlite3,kivy
-requirements = python3,kivy,pillow,xlsxwriter,charset-normalizer
+# ---- Source ----------------------------------------------------------------
+source.dir = .
+source.include_exts = py,png,jpg,kv,atlas,ttf
+source.exclude_dirs = tests,bin,venv,.git,.github,.buildozer
+source.exclude_patterns = test_*.py,smoke.py
 
-# (str) The directory in which python-for-android should look for your own build recipes
-p4a.local_recipes = ./p4a_recipes
+# ---- Python requirements ---------------------------------------------------
+# Only pure-Python packages or ones that have a python-for-android recipe.
+# Do NOT add packages with compiled code (charset-normalizer, numpy, openpyxl's
+# optional C extras, etc.) unless a recipe exists - that is what broke the build.
+requirements = python3,kivy,pyjnius,android,pillow,xlsxwriter,androidstorage4kivy
 
-# (str) Supported orientation (one of landscape, sensorLandscape, portrait or all)
+# ---- python-for-android ----------------------------------------------------
+# Pinned so the toolchain (and its Python version) can't change under you.
+# Unpinned "master" had moved to Python 3.14, which broke the pip install step.
+p4a.branch = v2024.01.21
+p4a.bootstrap = sdl2
+# Only enable if ./p4a_recipes contains recipes you actually need
+# (e.g. a custom pillow recipe). Not needed for the requirements above.
+# p4a.local_recipes = ./p4a_recipes
+
+# ---- Display ---------------------------------------------------------------
 orientation = portrait
-
-# (bool) Indicate if the application should be fullscreen or not
 fullscreen = 0
 
-# (list) Permissions
-android.permissions = CAMERA,READ_EXTERNAL_STORAGE,WRITE_EXTERNAL_STORAGE
+# ---- Android ---------------------------------------------------------------
+# Gallery picking and saving to Downloads use the system file picker /
+# MediaStore, so no storage permissions are needed.
+android.permissions = CAMERA
 
-# (int) Target Android API, should be as high as possible.
 android.api = 33
-
-# (int) Minimum API your APK will support.
 android.minapi = 24
-
-# (int) Android NDK API to use (API 24 exposes preadv/pwritev in Bionic libc)
-android.ndk_api = 24
-
-# (str) Android NDK version to use
 android.ndk = 25b
-
-# (list) The Android architectures to build for
+android.ndk_api = 24
 android.archs = arm64-v8a
 
-# (list) Gradle dependencies to add
-android.gradle_dependencies = com.google.mlkit:text-recognition:16.0.0, com.google.mlkit:vision-common:17.3.0, com.google.android.gms:play-services-tasks:18.1.0
-
-# (bool) Enable AndroidX support. Required for Google ML Kit.
+# AndroidX is required by Google ML Kit and androidstorage4kivy
 android.enable_androidx = True
+android.gradle_dependencies = com.google.mlkit:text-recognition:16.0.0, com.google.mlkit:vision-common:17.3.0, com.google.android.gms:play-services-tasks:18.1.0, androidx.documentfile:documentfile:1.0.1
 
-# (bool) If True, then skip trying to update the Android sdk
-# This can be useful to avoid excess Internet downloads or save time
-# when an update is due and you just want to test/build your package
-android.skip_update = False
+# Keep card data out of Android cloud/adb backups
+android.allow_backup = False
 
-# (bool) If True, then automatically accept the SDK license
-# agreements. This is intended for automation only.
 android.accept_sdk_license = True
-
-# (str) The format used to package the app for release mode (aab or apk)
+android.skip_update = False
 android.release_artifact = apk
-
-# (str) The format used to package the app for debug mode (apk or aar)
 android.debug_artifact = apk
 
+# Readable runtime logs: adb logcat (Python output only)
+android.logcat_filters = *:S python:D
+
 [buildozer]
-
-# (int) Log level (0 = error only, 1 = info, 2 = debug (with command output))
 log_level = 2
-
-# (int) Display warning if buildozer is run as root (0 = False, 1 = True)
 warn_on_root = 1
