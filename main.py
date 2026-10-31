@@ -53,6 +53,37 @@ from aadhaar_utils import (digits_only, export_records, format_aadhaar,
                            is_valid_aadhaar, mask_aadhaar, parse_aadhaar_text,
                            prepare_image)
 
+# ---------------------------------------------------------------- Android Java callbacks
+if IS_ANDROID:
+    from jnius import PythonJavaClass, java_method
+
+    # __javacontext__ = "app" makes pyjnius look the interface up with the APP's class
+    # loader. Without it, Google Play-services classes are "not found".
+    class _SuccessListener(PythonJavaClass):
+        __javainterfaces__ = ["com/google/android/gms/tasks/OnSuccessListener"]
+        __javacontext__ = "app"
+
+        def __init__(self, callback):
+            super().__init__()
+            self.callback = callback
+
+        @java_method("(Ljava/lang/Object;)V")
+        def onSuccess(self, result):
+            self.callback(result)
+
+    class _FailureListener(PythonJavaClass):
+        __javainterfaces__ = ["com/google/android/gms/tasks/OnFailureListener"]
+        __javacontext__ = "app"
+
+        def __init__(self, callback):
+            super().__init__()
+            self.callback = callback
+
+        @java_method("(Ljava/lang/Exception;)V")
+        def onFailure(self, exc):
+            self.callback(exc)
+
+
 # ---------------------------------------------------------------- settings
 BG = (0.05, 0.07, 0.12, 1)
 CARD = (0.09, 0.12, 0.20, 1)
@@ -252,15 +283,16 @@ class AadhaarMobileApp(App):
         self._status_base = ""
         self._action_buttons: List[Button] = []
 
-        # ML Kit and JNI state (resolved on main UI thread)
+        # ML Kit state (all Java objects are created and used on the MAIN thread only)
         self._mlkit_ready = False
         self._mlkit_error = None
-        self._app_loader = None
         self._BitmapFactory = None
         self._InputImage = None
-        self._TimeUnit = None
-        self._Tasks = None
         self._Environment = None
+        self._listeners: list = []
+        self._ocr_active = False
+        self._ocr_timeout = None
+        self._ocr_bitmap = None
 
         self.root_float = FloatLayout()
         main = BoxLayout(orientation="vertical", padding=dp(12), spacing=dp(8))
@@ -275,47 +307,35 @@ class AadhaarMobileApp(App):
 
     def on_start(self):
         if IS_ANDROID:
-            Clock.schedule_once(lambda _dt: self._init_android_services(), 0.3)
-
-    def _init_android_services(self):
-        try:
-            self._init_mlkit()
-        except Exception as exc:
-            Logger.exception(f"AadhaarScan: Android init error: {exc}")
+            Clock.schedule_once(lambda _dt: self._init_mlkit(), 0.3)
 
     def _init_mlkit(self) -> bool:
-        """Pre-load all ML Kit and Android classes on the MAIN thread so PyJNIus caches them."""
-        if not IS_ANDROID:
-            return True
-        if self._mlkit_ready and self._recognizer is not None:
+        """Resolve every ML Kit / Android class ONCE, on the main (Kivy) thread.
+
+        Threads created with threading.Thread cannot see the app's own Java classes
+        ("Didn't find class ... DexPathList"), so all JNI work stays on this thread.
+        """
+        if not IS_ANDROID or self._mlkit_ready:
             return True
         try:
             from jnius import autoclass
-            PythonActivity = autoclass("org.kivy.android.PythonActivity")
-            activity = PythonActivity.mActivity
-            if activity:
-                self._app_loader = activity.getClassLoader()
-                Thread = autoclass("java.lang.Thread")
-                Thread.currentThread().setContextClassLoader(self._app_loader)
-
             self._BitmapFactory = autoclass("android.graphics.BitmapFactory")
             self._InputImage = autoclass("com.google.mlkit.vision.common.InputImage")
-            self._TimeUnit = autoclass("java.util.concurrent.TimeUnit")
-            self._Tasks = autoclass("com.google.android.gms.tasks.Tasks")
+            autoclass("com.google.android.gms.tasks.Task")      # fail early if missing
             TextRecognition = autoclass("com.google.mlkit.vision.text.TextRecognition")
             Options = autoclass("com.google.mlkit.vision.text.latin.TextRecognizerOptions")
             self._recognizer = TextRecognition.getClient(Options.DEFAULT_OPTIONS)
             try:
                 self._Environment = autoclass("android.os.Environment")
             except Exception:
-                pass
+                self._Environment = None
             self._mlkit_ready = True
             self._mlkit_error = None
-            Logger.info("AadhaarScan: Google ML Kit loaded successfully on main thread")
+            Logger.info("AadhaarScan: ML Kit ready")
             return True
         except Exception as exc:
-            Logger.exception("AadhaarScan: ML Kit initialization failed on main thread")
-            self._mlkit_error = str(exc)
+            Logger.exception("AadhaarScan: ML Kit initialisation failed")
+            self._mlkit_error = str(exc) or exc.__class__.__name__
             return False
 
     def _build_header(self):
@@ -778,32 +798,35 @@ class AadhaarMobileApp(App):
         self._run_scan(lambda: path, owned=owned, rotate=rotate)
 
     def _run_scan(self, loader, owned=False, rotate=0):
+        """Start a scan. `loader()` returns the image path and runs on the MAIN thread
+        (Android file / JNI calls must not run on worker threads)."""
         if self._busy:
             return
-        if IS_ANDROID and not self._mlkit_ready:
-            if not self._init_mlkit():
-                self.toast(f"ML Kit unavailable: {self._mlkit_error}", error=True)
-                return
+        if IS_ANDROID and not self._mlkit_ready and not self._init_mlkit():
+            self.toast(f"ML Kit unavailable: {self._mlkit_error}", error=True, duration=4)
+            return
         self._purge_temp()
         self._set_busy(True, "Preparing image")
-        threading.Thread(target=self._scan_worker, args=(loader, owned, rotate),
-                         daemon=True).start()
+        # next frame, so the status text paints before a possibly slow file copy
+        Clock.schedule_once(lambda _dt: self._begin_scan(loader, owned, rotate), 0)
 
-    def _scan_worker(self, loader, owned, rotate):
-        """Runs off the UI thread. Only touch widgets via Clock.schedule_once."""
-        if IS_ANDROID and self._app_loader:
-            try:
-                from jnius import autoclass
-                Thread = autoclass("java.lang.Thread")
-                Thread.currentThread().setContextClassLoader(self._app_loader)
-            except Exception as exc:
-                Logger.warning(f"AadhaarScan: could not set worker thread classloader: {exc}")
+    def _begin_scan(self, loader, owned, rotate):
         try:
             src = loader()
             if not src or not os.path.exists(src):
                 raise FileNotFoundError("Image file not found")
-            if owned:
-                self._track_temp(src)
+        except Exception as exc:
+            Logger.exception("AadhaarScan: could not open image")
+            self._on_scan_error(str(exc) or exc.__class__.__name__)
+            return
+        if owned:
+            self._track_temp(src)
+        threading.Thread(target=self._scan_worker, args=(src, owned, rotate),
+                         daemon=True).start()
+
+    def _scan_worker(self, src, owned, rotate):
+        """Worker thread: pure-Python / Pillow work only. Never touch widgets or Java here."""
+        try:
             prepared = prepare_image(src, self._cache_dir(), rotate_deg=rotate)
             if prepared != src:
                 self._track_temp(prepared)
@@ -811,7 +834,10 @@ class AadhaarMobileApp(App):
                     self._discard(src)          # drop the big original right away
             Clock.schedule_once(lambda _dt: self._show_preview(prepared))
             Clock.schedule_once(lambda _dt: self._update_busy_text("Reading text"))
-            lines = self._recognise(prepared)
+            if IS_ANDROID:                      # ML Kit is driven from the main thread
+                Clock.schedule_once(lambda _dt: self._mlkit_start(prepared))
+                return
+            lines = self._desktop_lines(prepared)
             parsed = parse_aadhaar_text(lines)
             Clock.schedule_once(lambda _dt: self._on_scan_done(parsed, len(lines)))
         except Exception as exc:
@@ -844,27 +870,72 @@ class AadhaarMobileApp(App):
         self.set_status("Scan failed", error=True)
         self.toast(message, error=True, duration=4)
 
-    # ------------------------------------------------------------ OCR engines
-    def _recognise(self, path: str) -> List[str]:
-        return self._mlkit_lines(path) if IS_ANDROID else self._desktop_lines(path)
-
-    def _mlkit_lines(self, path: str) -> List[str]:
-        if not self._mlkit_ready or self._recognizer is None:
-            raise RuntimeError(f"ML Kit engine not ready: {self._mlkit_error or 'uninitialized'}")
-
-        bitmap = self._BitmapFactory.decodeFile(path)
-        if bitmap is None:
-            raise RuntimeError("Could not decode the image")
+    # ------------------------------------------------------------ OCR: ML Kit (Android)
+    def _mlkit_start(self, path):
+        """MAIN thread only. Starts recognition and returns immediately (no blocking);
+        the result arrives through the success / failure listeners."""
         try:
-            image = self._InputImage.fromBitmap(bitmap, 0)
-            task = self._recognizer.process(image)
-            # We're on a worker thread, so blocking here is fine - with a timeout.
-            result = getattr(self._Tasks, "await")(task, 25, self._TimeUnit.SECONDS)
-            text = result.getText() or ""
-        finally:
-            bitmap.recycle()
-        return [ln.strip() for ln in text.split("\n") if ln.strip()]
+            bitmap = self._BitmapFactory.decodeFile(path)
+            if bitmap is None:
+                raise RuntimeError("Could not decode the image")
+            self._ocr_bitmap = bitmap
+            task = self._recognizer.process(self._InputImage.fromBitmap(bitmap, 0))
+            self._listeners = [_SuccessListener(self._on_mlkit_success),
+                               _FailureListener(self._on_mlkit_failure)]
+            self._ocr_active = True
+            task.addOnSuccessListener(self._listeners[0])
+            task.addOnFailureListener(self._listeners[1])
+            self._ocr_timeout = Clock.schedule_once(self._ocr_timed_out, 25)
+        except Exception as exc:
+            Logger.exception("AadhaarScan: ML Kit start failed")
+            self._ocr_cleanup()
+            self._on_scan_error(str(exc) or exc.__class__.__name__)
 
+    def _on_mlkit_success(self, result):
+        """Called by Java on Android's UI thread: just hand the text to the Kivy thread."""
+        try:
+            text = result.getText() or ""
+        except Exception as exc:
+            message = f"Could not read ML Kit result: {exc}"
+            Clock.schedule_once(lambda _dt: self._ocr_finish(None, message))
+            return
+        Clock.schedule_once(lambda _dt: self._ocr_finish(text, None))
+
+    def _on_mlkit_failure(self, exc):
+        try:
+            detail = str(exc.getMessage())
+        except Exception:
+            detail = ""
+        message = f"ML Kit error: {detail}" if detail else "ML Kit could not read the image"
+        Clock.schedule_once(lambda _dt: self._ocr_finish(None, message))
+
+    def _ocr_timed_out(self, _dt):
+        self._ocr_finish(None, "Text recognition timed out - please try again")
+
+    def _ocr_cleanup(self):
+        self._ocr_active = False
+        if self._ocr_timeout is not None:
+            self._ocr_timeout.cancel()
+            self._ocr_timeout = None
+        if self._ocr_bitmap is not None:
+            try:
+                self._ocr_bitmap.recycle()
+            except Exception:
+                pass
+            self._ocr_bitmap = None
+        self._listeners = []
+
+    def _ocr_finish(self, text, error):
+        if not self._ocr_active:                 # already finished (e.g. timeout vs result)
+            return
+        self._ocr_cleanup()
+        if error:
+            self._on_scan_error(error)
+            return
+        lines = [ln.strip() for ln in (text or "").split("\n") if ln.strip()]
+        self._on_scan_done(parse_aadhaar_text(lines), len(lines))
+
+    # ------------------------------------------------------------ OCR: desktop
     def _desktop_lines(self, path: str) -> List[str]:
         try:
             if self._desktop_ocr is None:
@@ -891,22 +962,25 @@ class AadhaarMobileApp(App):
         threading.Thread(target=self._export_worker, args=(records, mask), daemon=True).start()
 
     def _export_worker(self, records, mask):
-        if IS_ANDROID and self._app_loader:
-            try:
-                from jnius import autoclass
-                Thread = autoclass("java.lang.Thread")
-                Thread.currentThread().setContextClassLoader(self._app_loader)
-            except Exception:
-                pass
+        """Worker thread: only builds the .xlsx (pure Python)."""
         try:
             private = os.path.join(self._export_dir(), f"Aadhaar_Data_{stamp()}.xlsx")
             export_records(records, private, mask=mask)
-            where = self._publish_file(private)
-            Clock.schedule_once(lambda _dt: self._on_export_done(where, len(records)))
+            Clock.schedule_once(lambda _dt: self._finish_export(private, len(records)))
         except Exception as exc:
             Logger.exception("AadhaarScan: export failed")
             message = str(exc) or exc.__class__.__name__
             Clock.schedule_once(lambda _dt: self._on_export_error(message))
+
+    def _finish_export(self, private, count):
+        """MAIN thread: publishing uses Android APIs through pyjnius."""
+        try:
+            where = self._publish_file(private)
+        except Exception as exc:
+            Logger.exception("AadhaarScan: publish failed")
+            self._on_export_error(str(exc) or exc.__class__.__name__)
+            return
+        self._on_export_done(where, count)
 
     def _publish_file(self, private_path: str) -> str:
         """Make the file visible to the user. Returns a readable location."""
