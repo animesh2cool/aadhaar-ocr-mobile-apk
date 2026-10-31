@@ -3,3 +3,4 @@ __pycache__/
 .buildozer/
 bin/
 .kivy/
+*.xlsx

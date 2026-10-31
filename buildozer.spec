@@ -20,7 +20,10 @@ version = 1.0.0
 
 # (list) Application requirements
 # comma separated e.g. requirements = sqlite3,kivy
-requirements = python3,kivy,pillow,xlsxwriter
+requirements = python3,kivy,pillow,xlsxwriter,charset-normalizer
+
+# (str) The directory in which python-for-android should look for your own build recipes
+p4a.local_recipes = ./p4a_recipes
 
 # (str) Supported orientation (one of landscape, sensorLandscape, portrait or all)
 orientation = portrait
